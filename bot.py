@@ -19,7 +19,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "@chotobaccharviralvideo")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@viral_koci_video")
 OWNER_ID = int(os.environ.get("OWNER_ID", "1749461380"))
 CAPTION = os.environ.get("CAPTION", "")
 
@@ -199,13 +199,25 @@ def post_item(item: dict) -> None:
     # Video age-i download hoye Telegram e save ache (file_id), tai
     # schedule-er somoy notun kore download korar dorkar nei.
     if item.get("file_id"):
-        bot.send_video(
-            CHANNEL_ID,
-            item["file_id"],
-            caption=CAPTION or None,
-            supports_streaming=True,
-            timeout=120,
-        )
+        kind = item.get("kind", "video")
+        # Forward kora video-te kono caption jabe na
+        caption = None if item.get("source") == "forward" else (CAPTION or None)
+        if kind == "document":
+            bot.send_document(
+                CHANNEL_ID, item["file_id"], caption=caption, timeout=120
+            )
+        elif kind == "animation":
+            bot.send_animation(
+                CHANNEL_ID, item["file_id"], caption=caption, timeout=120
+            )
+        else:
+            bot.send_video(
+                CHANNEL_ID,
+                item["file_id"],
+                caption=caption,
+                supports_streaming=True,
+                timeout=120,
+            )
         return
 
     # Fallback: file_id na thakle ekhon download kore upload
@@ -352,6 +364,54 @@ def clear_queue(message):
         count = len(load_queue())
         save_queue([])
     bot.reply_to(message, f"🗑 {count} ta video queue theke bad dewa holo.")
+
+
+@bot.message_handler(content_types=["video", "animation", "document"])
+def handle_forwarded_video(message):
+    if not is_owner(message):
+        bot.reply_to(message, "⛔ Ei bot shudhu owner-er jonno.")
+        return
+
+    # Forward kora (ba sorasori pathano) video, download-er dorkar nei
+    if message.video:
+        media, kind = message.video, "video"
+    elif message.animation:
+        media, kind = message.animation, "animation"
+    elif message.document and (message.document.mime_type or "").startswith(
+        "video/"
+    ):
+        media, kind = message.document, "document"
+    else:
+        bot.reply_to(message, "❌ Shudhu video pathan ba forward koren.")
+        return
+
+    unique_id = media.file_unique_id
+
+    with queue_lock:
+        items = load_queue()
+        if any(i.get("unique_id") == unique_id for i in items):
+            bot.reply_to(message, "⚠️ Ei video agei queue te ache.")
+            return
+        slot = next_free_slot(items)
+        items.append(
+            {
+                "id": uuid.uuid4().hex,
+                "url": "📩 Forward kora video",
+                "file_id": media.file_id,
+                "unique_id": unique_id,
+                "kind": kind,
+                "source": "forward",
+                "time": slot.isoformat(),
+                "attempts": 0,
+            }
+        )
+        save_queue(items)
+
+    bot.reply_to(
+        message,
+        f"✅ Channel e jabe: <b>{pretty_time(slot)}</b>\n"
+        "(shudhu video jabe, caption jabe na)",
+    )
 
 
 @bot.message_handler(func=lambda m: m.text is not None)
