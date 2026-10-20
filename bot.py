@@ -218,4 +218,7 @@ def handle_link(message):
 if __name__ == "__main__":
     keep_alive()
     log.info("Bot is starting... Channel: %s | Owner: %s", CHANNEL_ID, OWNER_ID)
-    bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+    # skip_pending intentionally NOT used: it makes one extra getUpdates call
+    # outside the retry loop, which crashes the deploy on a 409 conflict.
+    # infinity_polling retries automatically until the old instance is gone.
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
