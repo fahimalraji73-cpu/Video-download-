@@ -9,11 +9,20 @@ import yt_dlp
 from flask import Flask
 
 # --------------------------------------------------------------------------
-# Configuration
+# Configuration (set these in Render -> Environment)
 # --------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set.")
+
+# Channel jekhane video upload hobe (username ba -100... numeric ID)
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@viral_koci_video")
+
+# Shudhu ei user bot use korte parbe (apnar Telegram user ID)
+OWNER_ID = int(os.environ.get("OWNER_ID", "1749461380"))
+
+# Channel post-er caption (khali rakhle caption thakbe na)
+CAPTION = os.environ.get("CAPTION", "")
 
 PORT = int(os.environ.get("PORT", 10000))
 DOWNLOAD_DIR = "downloads"
@@ -52,7 +61,6 @@ def health():
 
 
 def run_flask():
-    # Flask's built-in server is fine for a simple health-check endpoint.
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
@@ -72,7 +80,6 @@ def download_video(url: str) -> str:
 
     ydl_opts = {
         "outtmpl": output_template,
-        # Prefer a single mp4 file under 50 MB so no ffmpeg merge is needed.
         "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best",
         "noplaylist": True,
         "quiet": True,
@@ -81,7 +88,6 @@ def download_video(url: str) -> str:
         "retries": 3,
     }
 
-    # Optional: cookies help with Instagram/Facebook rate limits or login walls.
     if os.path.exists("cookies.txt"):
         ydl_opts["cookiefile"] = "cookies.txt"
 
@@ -90,7 +96,6 @@ def download_video(url: str) -> str:
         file_path = ydl.prepare_filename(info)
 
     if not os.path.exists(file_path):
-        # Fallback: locate the file by its unique id prefix.
         for name in os.listdir(DOWNLOAD_DIR):
             if name.startswith(file_id):
                 file_path = os.path.join(DOWNLOAD_DIR, name)
@@ -109,31 +114,42 @@ def safe_remove(path):
         log.error("Could not delete %s: %s", path, exc)
 
 
+def is_owner(message) -> bool:
+    return message.from_user is not None and message.from_user.id == OWNER_ID
+
+
 # --------------------------------------------------------------------------
 # Bot handlers
 # --------------------------------------------------------------------------
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
+    if not is_owner(message):
+        bot.reply_to(message, "⛔ Ei bot shudhu owner-er jonno.")
+        return
     bot.reply_to(
         message,
         "👋 <b>Welcome!</b>\n\n"
-        "Send me an <b>Instagram Reel</b> or <b>Facebook video</b> link "
-        "and I'll download it for you.",
+        "Instagram Reel ba Facebook video-r link pathan. "
+        f"Ami video download kore {CHANNEL_ID} channel e upload kore dibo.",
     )
 
 
 @bot.message_handler(func=lambda m: m.text is not None)
 def handle_link(message):
+    if not is_owner(message):
+        bot.reply_to(message, "⛔ Ei bot shudhu owner-er jonno.")
+        return
+
     match = URL_PATTERN.search(message.text)
     if not match:
         bot.reply_to(
             message,
-            "❌ Please send a valid Instagram Reel or Facebook video link.",
+            "❌ Valid Instagram Reel ba Facebook video link pathan.",
         )
         return
 
     url = match.group(1)
-    status = bot.reply_to(message, "⏳ Downloading, please wait...")
+    status = bot.reply_to(message, "⏳ Download hocche, wait koren...")
     file_path = None
 
     try:
@@ -141,47 +157,58 @@ def handle_link(message):
 
         if os.path.getsize(file_path) > MAX_FILE_SIZE:
             bot.edit_message_text(
-                "⚠️ The video is larger than Telegram's 50 MB bot limit.",
+                "⚠️ Video 50 MB-er boro, Telegram bot eta pathate pare na.",
                 chat_id=status.chat.id,
                 message_id=status.message_id,
             )
             return
 
         bot.edit_message_text(
-            "📤 Uploading...",
+            f"📤 {CHANNEL_ID} channel e upload hocche...",
             chat_id=status.chat.id,
             message_id=status.message_id,
         )
 
         with open(file_path, "rb") as video:
             bot.send_video(
-                message.chat.id,
+                CHANNEL_ID,
                 video,
-                caption="✅ Downloaded successfully!",
-                reply_to_message_id=message.message_id,
+                caption=CAPTION or None,
                 supports_streaming=True,
                 timeout=120,
             )
 
-        bot.delete_message(status.chat.id, status.message_id)
+        bot.edit_message_text(
+            f"✅ Channel e upload hoye geche: {CHANNEL_ID}",
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+        )
 
     except yt_dlp.utils.DownloadError as exc:
         log.warning("Download error for %s: %s", url, exc)
         bot.edit_message_text(
-            "❌ Could not download this video. It may be private, "
-            "removed, or unsupported.",
+            "❌ Video download kora gelo na. Private, delete kora, "
+            "ba unsupported hote pare.",
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+        )
+    except telebot.apihelper.ApiTelegramException as exc:
+        log.error("Telegram error: %s", exc)
+        bot.edit_message_text(
+            "❌ Channel e upload hoy nai. Bot ta channel er Admin ache kina "
+            "ar CHANNEL_ID thik ache kina check koren.",
             chat_id=status.chat.id,
             message_id=status.message_id,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("Unexpected error: %s", exc)
         bot.edit_message_text(
-            "❌ Something went wrong. Please try again later.",
+            "❌ Kichu ekta vul hoyeche. Pore abar try koren.",
             chat_id=status.chat.id,
             message_id=status.message_id,
         )
     finally:
-        # CLEANUP: always delete the file right after sending (or on failure).
+        # CLEANUP: upload shesh hole (ba fail hole) server theke file delete
         safe_remove(file_path)
 
 
@@ -190,5 +217,5 @@ def handle_link(message):
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     keep_alive()
-    log.info("Bot is starting...")
+    log.info("Bot is starting... Channel: %s | Owner: %s", CHANNEL_ID, OWNER_ID)
     bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
