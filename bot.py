@@ -327,9 +327,10 @@ def send_item(item: dict) -> None:
     file_id = item["file_id"]
     kw = {}
     if kind in CAPTION_KINDS:
-        original = item.get("orig_caption")
+        # Video-r nijer caption jabe na, shudhu apnar set kora caption jabe.
+        original = None if kind == "video" else item.get("orig_caption")
         if original:
-            # Post-er nijer caption thakle sheta-i jabe (formatting shoho)
+            # Onno post-er (photo ityadi) nijer caption thakle sheta-i jabe
             kw["caption"] = original
             kw["parse_mode"] = "HTML"
         else:
@@ -518,8 +519,8 @@ def send_welcome(message):
         "/addslot 10:00 - ekta slot abar jog koren\n"
         "/settime 2 17:30 - 2 number post-er somoy bodlan\n\n"
         "<b>Caption</b>\n"
-        "/caption Amar caption - caption set koren (shudhu je post-e "
-        "nijer caption nai)\n"
+        "/caption Amar caption - caption set koren (video-te shob shomoy "
+        "jabe)\n"
         "/caption - ekhon ki caption dekhen\n"
         "/nocaption - caption bad den",
     )
@@ -766,9 +767,9 @@ def caption_cmd(message):
     if text:
         bot.reply_to(
             message,
-            "✅ Caption set hoyeche. Je post-e nijer caption nai shudhu "
-            "sheikhane ei caption jabe. Je post-e nijer caption ache, "
-            "sheta-i jabe.",
+            "✅ Caption set hoyeche. Video-te shob shomoy ei caption jabe "
+            "(forward kora video-r nijer caption jabe na). Photo ba onno "
+            "post-e nijer caption thakle sheta jabe, na thakle ei caption.",
         )
     else:
         bot.reply_to(message, "✅ Caption bad dewa holo.")
@@ -955,8 +956,9 @@ def screen_help():
         "• <b>Queue</b>: post-e tap kore somoy bodlan, ekhoni post korun, "
         "ba bad den.\n"
         "• <b>Slots</b>: daily upload-er somoy add ba bad den.\n"
-        "• <b>Caption</b>: je post-e nijer caption nai shudhu sheikhane "
-        "ei caption jabe. Post-er nijer caption thakle sheta-i jabe."
+        "• <b>Caption</b>: video-te shob shomoy apnar set kora caption jabe "
+        "(forward kora video-r nijer caption jabe na). Photo ba onno post-e "
+        "nijer caption thakle sheta jabe."
     )
     return text, kb
 
@@ -1093,14 +1095,15 @@ def screen_caption():
     if current:
         text = (
             "📝 <b>Ekhon caption:</b>\n\n" + html.escape(current) + "\n\n"
-            "Je post-e nijer caption nai shudhu sheikhane jabe."
+            "Video-te shob shomoy ei caption jabe. Photo ba onno post-e "
+            "nijer caption thakle sheta jabe."
         )
         kb.row(btn("✏️ Caption bodlan", "c:set"), btn("🗑 Bad den", "c:off"))
     else:
         text = (
             "📝 Ekhon kono caption nai.\n\n"
-            "Caption set korle je post-e nijer caption nai shudhu "
-            "sheikhane jabe."
+            "Caption set korle video-te shob shomoy sheta jabe. Photo ba "
+            "onno post-e nijer caption thakle sheta jabe."
         )
         kb.row(btn("✏️ Caption set korun", "c:set"))
     kb.row(*home_row())
@@ -1338,7 +1341,9 @@ def schedule_post(message) -> None:
             "file_id": file_id,
             "unique_id": unique_id,
             "orig_caption": (
-                getattr(message, "html_caption", None) if message.caption else None
+                getattr(message, "html_caption", None)
+                if message.caption and kind != "video"
+                else None
             ),
             "source": "forward",
         }
