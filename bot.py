@@ -3,6 +3,7 @@ import re
 import json
 import time
 import uuid
+import hmac
 import html
 import logging
 import threading
@@ -11,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import telebot
 import yt_dlp
-from flask import Flask
+from flask import Flask, request
 
 # --------------------------------------------------------------------------
 # Configuration (Render -> Environment e change kora jay)
@@ -22,6 +23,12 @@ if not BOT_TOKEN:
 
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "@viral_koci_video")
 OWNER_ID = int(os.environ.get("OWNER_ID", "1749461380"))
+
+# Onno app/automation theke link pathanor gopon key (Render -> Environment)
+API_KEY = os.environ.get("API_KEY", "")
+
+# Private "inbox" channel: ei channel e link post hole bot auto download kore
+INBOX_CHANNEL_ID = os.environ.get("INBOX_CHANNEL_ID", "").strip()
 
 # Shuru-r caption (bot theke /caption diye bodlano jay)
 DEFAULT_CAPTION = os.environ.get("CAPTION", "")
@@ -73,6 +80,26 @@ def home():
 @app.route("/health")
 def health():
     return {"status": "ok"}, 200
+
+
+@app.route("/add", methods=["GET", "POST"])
+def api_add():
+    """Onno app theke link pathanor jonno: /add?key=...&text=LINK"""
+    key = request.values.get("key", "")
+    if not API_KEY or not hmac.compare_digest(key, API_KEY):
+        return {"ok": False, "error": "unauthorized"}, 401
+
+    text = request.values.get("text") or request.values.get("url") or ""
+    if not text and request.is_json:
+        data = request.get_json(silent=True) or {}
+        text = str(data.get("text") or data.get("url") or "")
+
+    urls = URL_PATTERN.findall(text)
+    if not urls:
+        return {"ok": False, "error": "no valid instagram/facebook link"}, 400
+
+    count = start_bulk(OWNER_ID, urls)
+    return {"ok": True, "links": count}, 200
 
 
 def run_flask():
@@ -791,83 +818,240 @@ def no_caption(message):
 # --------------------------------------------------------------------------
 # Link pathale: sathe sathe download, slot e upload
 # --------------------------------------------------------------------------
-def handle_links(message, urls: list) -> None:
-    for url in urls:
-        with queue_lock:
-            already = any(i.get("url") == url for i in load_queue())
-        if already:
-            bot.reply_to(
-                message,
-                f"⚠️ Agei queue te ache:\n{html.escape(url)}",
+download_lock = threading.Lock()  # ekshathe shudhu ekta download/upload
+bulk_jobs = {}  # job_id -> threading.Event (stop korar jonno)
+
+
+def normalize_url(url: str) -> str:
+    """Link porishkar kore. Instagram-er tracking part (?igsh=...) bad dey."""
+    url = url.rstrip(".,;:!?)]}>\"'")
+    if "instagram.com" in url.lower():
+        url = url.split("?")[0].split("#")[0]
+    return url
+
+
+def send_with_retry(func):
+    """Telegram flood limit (429) hole opekkha kore abar try kore."""
+    for attempt in range(4):
+        try:
+            return func()
+        except telebot.apihelper.ApiTelegramException as exc:
+            if getattr(exc, "error_code", None) == 429 and attempt < 3:
+                wait = 5
+                try:
+                    wait = int(exc.result_json["parameters"]["retry_after"]) + 1
+                except Exception:  # noqa: BLE001
+                    pass
+                log.warning("Flood limit, waiting %s seconds", wait)
+                time.sleep(wait)
+                continue
+            raise
+
+
+def send_owner_video(file_path: str):
+    def _send():
+        with open(file_path, "rb") as video:
+            return bot.send_video(
+                OWNER_ID,
+                video,
+                caption="💾 Save kora hoyeche.",
+                supports_streaming=True,
+                timeout=120,
+                disable_notification=True,
+            )
+
+    return send_with_retry(_send)
+
+
+def process_link(url: str):
+    """Ekta link download kore queue te rakhe. (status, info) return kore."""
+    with queue_lock:
+        if any(i.get("url") == url for i in load_queue()):
+            return "dup", None
+
+    file_path = None
+    try:
+        with download_lock:
+            # 1) Download
+            file_path = download_video(url)
+            if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                return "big", None
+            # 2) Apnar private chat e save (Telegram-er server e thake)
+            sent = send_owner_video(file_path)
+
+        if sent.video:
+            kind, media = "video", sent.video
+        else:
+            kind, media = "document", sent.document
+
+        # 3) Porer free slot e schedule
+        slot = enqueue(
+            {
+                "url": url,
+                "label": url,
+                "kind": kind,
+                "file_id": media.file_id,
+                "unique_id": media.file_unique_id,
+            }
+        )
+        return "ok", slot
+
+    except yt_dlp.utils.DownloadError as exc:
+        log.warning("Download error for %s: %s", url, exc)
+        return "fail", None
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Unexpected error for %s: %s", url, exc)
+        return "fail", None
+    finally:
+        # CLEANUP: server theke file sathe sathe delete
+        safe_remove(file_path)
+
+
+def run_bulk(chat_id: int, status, urls: list, job_id: str, stop: threading.Event):
+    total = len(urls)
+    ok_slots, dup, big, failed = [], 0, 0, []
+    stopped = False
+    n = 1
+
+    def stop_markup():
+        kb = types.InlineKeyboardMarkup()
+        kb.row(types.InlineKeyboardButton("⏹ Bondho koren", callback_data=f"b:{job_id}"))
+        return kb
+
+    def edit(text, markup=None):
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=status.message_id,
+                reply_markup=markup,
                 disable_web_page_preview=True,
             )
-            continue
+        except Exception:  # noqa: BLE001
+            pass
 
-        status = bot.reply_to(message, "⏳ Video download hocche...")
-        file_path = None
-        try:
-            # 1) Sathe sathe download
-            file_path = download_video(url)
+    for n, url in enumerate(urls, start=1):
+        if stop.is_set():
+            stopped = True
+            break
+        edit(
+            f"⏳ {n}/{total} download hocche...\n"
+            f"✅ {len(ok_slots)} ta ready   ❌ {len(failed)} ta fail",
+            stop_markup(),
+        )
+        result, info = process_link(url)
+        if result == "ok":
+            ok_slots.append(info)
+        elif result == "dup":
+            dup += 1
+        elif result == "big":
+            big += 1
+            failed.append(url)
+        else:
+            failed.append(url)
+        time.sleep(1.5)  # Telegram-er flood limit theke bachte
 
-            if os.path.getsize(file_path) > MAX_FILE_SIZE:
-                bot.edit_message_text(
-                    "⚠️ Video 50 MB-er boro, Telegram bot eta pathate pare na.",
-                    chat_id=status.chat.id,
-                    message_id=status.message_id,
-                )
-                continue
+    bulk_jobs.pop(job_id, None)
 
-            # 2) Apnar private chat e save (Telegram-er server e thake)
-            with open(file_path, "rb") as video:
-                sent = bot.send_video(
-                    OWNER_ID,
-                    video,
-                    caption="💾 Save kora hoyeche. Schedule-er somoy channel e jabe.",
-                    supports_streaming=True,
-                    timeout=120,
-                )
-            if sent.video:
-                kind, media = "video", sent.video
-            else:
-                kind, media = "document", sent.document
-
-            # 3) Porer free slot e schedule
-            slot = enqueue(
-                {
-                    "url": url,
-                    "label": url,
-                    "kind": kind,
-                    "file_id": media.file_id,
-                    "unique_id": media.file_unique_id,
-                }
+    # Ekta matro link hole choto message
+    if total == 1 and not stopped:
+        if ok_slots:
+            edit(
+                "✅ Download hoye geche. Channel e jabe: "
+                f"<b>{pretty_time(ok_slots[0])}</b>"
             )
-
-            bot.edit_message_text(
-                f"✅ Download hoye geche. Channel e jabe: "
-                f"<b>{pretty_time(slot)}</b>",
-                chat_id=status.chat.id,
-                message_id=status.message_id,
-            )
-
-        except yt_dlp.utils.DownloadError as exc:
-            log.warning("Download error for %s: %s", url, exc)
-            bot.edit_message_text(
+        elif dup:
+            edit("⚠️ Ei link agei queue te ache.")
+        elif big:
+            edit("⚠️ Video 50 MB-er boro, Telegram bot eta pathate pare na.")
+        else:
+            edit(
                 "❌ Video download kora gelo na. Private, delete kora, "
                 "ba unsupported hote pare. Onno bot diye download kore "
-                "ekhane forward korte paren.",
-                chat_id=status.chat.id,
-                message_id=status.message_id,
+                "ekhane forward korte paren."
             )
+        return
+
+    lines = ["🛑 <b>Bondho kora hoyeche.</b>" if stopped else "🏁 <b>Shesh!</b>", ""]
+    lines.append(f"✅ Schedule hoyeche: <b>{len(ok_slots)}</b> ta")
+    if dup:
+        lines.append(f"⚠️ Agei queue te chilo: {dup} ta")
+    if big:
+        lines.append(f"⚠️ 50 MB-er boro: {big} ta")
+    fail_count = len(failed) - big
+    if fail_count:
+        lines.append(f"❌ Download hoy nai: {fail_count} ta")
+    if stopped:
+        lines.append(f"⏹ Baki {total - n + 1} ta link process kora hoyni.")
+    if ok_slots:
+        ok_slots.sort()
+        lines.append("")
+        lines.append(f"📅 Prothom post: {pretty_time(ok_slots[0])}")
+        lines.append(f"📅 Shesh post: {pretty_time(ok_slots[-1])}")
+    edit("\n".join(lines))
+
+    if failed:
+        out = ["❌ Ei link gulo hoy nai (abar pathan, ba onno bot diye "
+               "download kore forward koren):", ""]
+        out += [html.escape(u) for u in failed]
+        try:
+            reply_long(status, out)
         except Exception as exc:  # noqa: BLE001
-            log.exception("Unexpected error: %s", exc)
-            bot.edit_message_text(
-                "❌ Kichu ekta vul hoyeche. Pore abar try koren.",
-                chat_id=status.chat.id,
-                message_id=status.message_id,
-            )
-        finally:
-            # CLEANUP: server theke file sathe sathe delete
-            safe_remove(file_path)
+            log.error("Could not send failed list: %s", exc)
+
+
+def handle_links(message, urls: list) -> None:
+    # Link porishkar kora + ekoi message e duibar thakle ekbar rakha
+    seen, clean = set(), []
+    for raw in urls:
+        url = normalize_url(raw)
+        if url not in seen:
+            seen.add(url)
+            clean.append(url)
+
+    total = len(clean)
+    status = bot.reply_to(
+        message,
+        f"⏳ {total} ta link paoa gelo. Ekta ekta kore download hobe...",
+    )
+
+    job_id = uuid.uuid4().hex[:8]
+    stop = threading.Event()
+    bulk_jobs[job_id] = stop
+
+    # Alada thread e chalano hoy, jate bot menu/button atke na thake
+    threading.Thread(
+        target=run_bulk,
+        args=(message.chat.id, status, clean, job_id, stop),
+        daemon=True,
+    ).start()
+
+
+def start_bulk(chat_id: int, raw_urls: list) -> int:
+    """Link gulo download + schedule shuru kore (API theke ashle). Koyta link nilo return kore."""
+    seen, clean = set(), []
+    for raw in raw_urls:
+        url = normalize_url(raw)
+        if url not in seen:
+            seen.add(url)
+            clean.append(url)
+    clean = clean[:100]
+    if not clean:
+        return 0
+
+    status = bot.send_message(
+        chat_id,
+        f"⏳ {len(clean)} ta link paoa gelo (auto). Ekta ekta kore download hobe...",
+    )
+    job_id = uuid.uuid4().hex[:8]
+    stop = threading.Event()
+    bulk_jobs[job_id] = stop
+    threading.Thread(
+        target=run_bulk,
+        args=(chat_id, status, clean, job_id, stop),
+        daemon=True,
+    ).start()
+    return len(clean)
 
 
 # --------------------------------------------------------------------------
@@ -1297,6 +1481,14 @@ def on_callback(call):
                 toast = "🗑 Caption bad dewa holo"
                 render(msg, screen_caption())
 
+        elif key == "b":
+            stop_event = bulk_jobs.get(parts[1])
+            if stop_event:
+                stop_event.set()
+                toast = "⏹ Cholmaan link shesh hole bondho hobe"
+            else:
+                toast = "Ei kaj ta agei shesh hoye geche"
+
         elif key == "p":
             pending.clear()
             bot.edit_message_text(
@@ -1421,16 +1613,64 @@ def handle_any(message):
 
 
 # --------------------------------------------------------------------------
+# Private inbox channel: onno bot/app ei channel e link post korle auto download
+# --------------------------------------------------------------------------
+announced_channels = set()
+
+
+def is_main_channel(chat) -> bool:
+    main = str(CHANNEL_ID).lower().lstrip("@")
+    return str(chat.id) == str(CHANNEL_ID) or (
+        bool(chat.username) and chat.username.lower() == main
+    )
+
+
+@bot.channel_post_handler(content_types=["text"])
+def handle_channel_post(message):
+    chat = message.chat
+
+    # Upload-er main channel-er post ignore
+    if is_main_channel(chat):
+        return
+
+    # INBOX_CHANNEL_ID set na thakle shudhu channel-er ID ta owner ke janay
+    if not INBOX_CHANNEL_ID:
+        if chat.id not in announced_channels:
+            announced_channels.add(chat.id)
+            notify_owner(
+                "📡 Ekta channel theke post paoa gelo.\n"
+                f"Channel: {html.escape(chat.title or '')}\n"
+                f"Channel ID: <code>{chat.id}</code>\n\n"
+                "Eta Render Environment e <code>INBOX_CHANNEL_ID</code> "
+                "hishebe dien."
+            )
+        return
+
+    if str(chat.id) != INBOX_CHANNEL_ID:
+        return
+
+    urls = URL_PATTERN.findall(message.text or "")
+    if urls:
+        start_bulk(OWNER_ID, urls)
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     load_settings()
     keep_alive()
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    log.info("Link API (/add): %s", "ON" if API_KEY else "OFF (API_KEY nai)")
+    log.info("Inbox channel: %s", INBOX_CHANNEL_ID or "set kora nai")
     log.info(
         "Bot is starting... Channel: %s | Owner: %s | Slots: %s",
         CHANNEL_ID, OWNER_ID, ", ".join(settings["slots"]),
     )
     # skip_pending intentionally NOT used: infinity_polling retries on its own
     # if an old instance still holds the getUpdates connection (409).
-    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    bot.infinity_polling(
+        timeout=30,
+        long_polling_timeout=30,
+        allowed_updates=["message", "callback_query", "channel_post"],
+    )
