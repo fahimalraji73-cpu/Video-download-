@@ -30,7 +30,8 @@ API_KEY = os.environ.get("API_KEY", "")
 # Private "inbox" channel: ei channel e link post hole bot auto download kore
 INBOX_CHANNEL_ID = os.environ.get("INBOX_CHANNEL_ID", "").strip()
 
-# Shuru-r caption (bot theke /caption diye bodlano jay)
+# Shuru-r caption (bot theke bodlano jay). Ekadhik dite "||" diye alada koren:
+#   CAPTION = caption1||caption2||caption3
 DEFAULT_CAPTION = os.environ.get("CAPTION", "")
 
 # Shuru-r slot (bot theke /setslots diye bodlano jay)
@@ -49,6 +50,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # Telegram Bot API upload limit: 50 MB
 MAX_ATTEMPTS = 3
 RETRY_DELAY_MIN = 5
 CAPTION_KINDS = {"photo", "video", "animation", "document", "audio", "voice"}
+MAX_CAPTIONS = 30
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -150,9 +152,22 @@ def load_settings() -> None:
             if data.get("slots") else parse_slot_list(DEFAULT_SLOTS)
     except ValueError:
         slots = parse_slot_list(DEFAULT_SLOTS)
+    captions = data.get("captions")
+    if captions is None:
+        legacy = data.get("caption")
+        if legacy:
+            captions = [legacy]
+        else:
+            captions = [c.strip() for c in DEFAULT_CAPTION.split("||")]
+    captions = [c for c in captions if c]
+    try:
+        index = int(data.get("caption_index", 0) or 0)
+    except (TypeError, ValueError):
+        index = 0
     settings = {
         "slots": slots,
-        "caption": data.get("caption", DEFAULT_CAPTION) or "",
+        "captions": captions,
+        "caption_index": index,
     }
 
 
@@ -171,9 +186,47 @@ def get_slots() -> list:
         ]
 
 
-def get_caption():
+def get_captions() -> list:
     with settings_lock:
-        return settings["caption"] or None
+        return list(settings["captions"])
+
+
+def next_caption_info():
+    """Porer video-te kon caption jabe: (index, text), na thakle None."""
+    with settings_lock:
+        caps = settings["captions"]
+        if not caps:
+            return None
+        idx = settings["caption_index"] % len(caps)
+        return idx, caps[idx]
+
+
+def get_caption():
+    """Porer video-r caption (dekhe, index bodlay na)."""
+    info = next_caption_info()
+    return info[1] if info else None
+
+
+def advance_caption() -> None:
+    """Caption bebohar hoye gele porer caption-e jaoa."""
+    with settings_lock:
+        count = len(settings["captions"])
+        if count:
+            settings["caption_index"] = (settings["caption_index"] + 1) % count
+            save_settings()
+
+
+def format_captions() -> str:
+    caps = get_captions()
+    info = next_caption_info()
+    lines = []
+    for n, text in enumerate(caps, start=1):
+        marker = "➡️ " if info and info[0] == n - 1 else ""
+        preview = text.replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:80] + "…"
+        lines.append(f"{marker}{n}. {html.escape(preview)}")
+    return "\n".join(lines)
 
 
 def format_slots() -> str:
@@ -353,6 +406,7 @@ def send_item(item: dict) -> None:
 
     file_id = item["file_id"]
     kw = {}
+    used_bot_caption = False
     if kind in CAPTION_KINDS:
         # Video-r nijer caption jabe na, shudhu apnar set kora caption jabe.
         original = None if kind == "video" else item.get("orig_caption")
@@ -365,6 +419,7 @@ def send_item(item: dict) -> None:
             if caption:
                 kw["caption"] = caption
                 kw["parse_mode"] = ""  # caption plain text hishebe jabe
+                used_bot_caption = True
 
     if kind == "photo":
         bot.send_photo(CHANNEL_ID, file_id, **kw)
@@ -387,6 +442,10 @@ def send_item(item: dict) -> None:
     else:
         raise ValueError(f"Unknown kind: {kind}")
 
+    # Post shofol hole porer caption-e jan (serial)
+    if used_bot_caption:
+        advance_caption()
+
 
 def post_item(item: dict) -> None:
     if item.get("file_id") or item.get("kind") == "copy":
@@ -405,6 +464,8 @@ def post_item(item: dict) -> None:
             bot.send_video(
                 CHANNEL_ID, video, supports_streaming=True, timeout=120, **kw
             )
+        if caption:
+            advance_caption()
     finally:
         safe_remove(file_path)
 
@@ -546,10 +607,11 @@ def send_welcome(message):
         "/addslot 10:00 - ekta slot abar jog koren\n"
         "/settime 2 17:30 - 2 number post-er somoy bodlan\n\n"
         "<b>Caption</b>\n"
-        "/caption Amar caption - caption set koren (video-te shob shomoy "
-        "jabe)\n"
-        "/caption - ekhon ki caption dekhen\n"
-        "/nocaption - caption bad den",
+        "/caption Amar caption - caption jog koren (ekadhik dile serial "
+        "onujayi jabe)\n"
+        "/caption - caption list dekhen\n"
+        "/delcaption 2 - 2 number caption bad den\n"
+        "/nocaption - shob caption bad den",
     )
 
 
@@ -765,41 +827,72 @@ def caption_cmd(message):
         return deny(message)
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        current = get_caption()
-        if current:
+        if get_captions():
             bot.reply_to(
                 message,
-                "📝 Ekhon caption:\n\n" + html.escape(current) + "\n\n"
-                "Bodlate: /caption notun caption\n"
-                "Bad dite: /nocaption",
+                "📝 <b>Caption list</b> (serial onujayi, ekta ekta kore):\n\n"
+                + format_captions()
+                + "\n\n➡️ = porer video-te ei caption jabe.\n"
+                "Jog korte: /caption notun caption\n"
+                "Bad dite: /delcaption 2 ba /nocaption (shob)",
             )
         else:
             bot.reply_to(
                 message,
                 "📝 Ekhon kono caption nai.\n"
-                "Set korte: /caption Amar caption",
+                "Jog korte: /caption Amar caption",
             )
         return
 
     text = parts[1].strip()
-    if text.lower() in ("off", "none", "remove"):
-        text = ""
     if len(text) > 1024:
         bot.reply_to(message, "❌ Caption 1024 akhor-er moddhe rakhen.")
         return
 
     with settings_lock:
-        settings["caption"] = text
-        save_settings()
-    if text:
+        full = len(settings["captions"]) >= MAX_CAPTIONS
+        if not full:
+            settings["captions"].append(text)
+            total = len(settings["captions"])
+            save_settings()
+    if full:
         bot.reply_to(
-            message,
-            "✅ Caption set hoyeche. Video-te shob shomoy ei caption jabe "
-            "(forward kora video-r nijer caption jabe na). Photo ba onno "
-            "post-e nijer caption thakle sheta jabe, na thakle ei caption.",
+            message, f"❌ Shorbocho {MAX_CAPTIONS} ta caption rakha jay."
         )
-    else:
-        bot.reply_to(message, "✅ Caption bad dewa holo.")
+        return
+    bot.reply_to(
+        message,
+        f"✅ Caption #{total} jog hoyeche. Ekhon moto {total} ta caption, "
+        "video-te serial onujayi jabe.",
+    )
+
+
+@bot.message_handler(commands=["delcaption"])
+def delete_caption(message):
+    if not is_owner(message):
+        return deny(message)
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.reply_to(message, "Likhen: /delcaption 2")
+        return
+    number = int(parts[1])
+    with settings_lock:
+        caps = settings["captions"]
+        if number < 1 or number > len(caps):
+            ok = False
+        else:
+            ok = True
+            caps.pop(number - 1)
+            if settings["caption_index"] > number - 1:
+                settings["caption_index"] -= 1
+            settings["caption_index"] = (
+                settings["caption_index"] % len(caps) if caps else 0
+            )
+            save_settings()
+    if not ok:
+        bot.reply_to(message, "❌ Ei number e caption nai. /caption dekhen.")
+        return
+    bot.reply_to(message, f"🗑 Caption #{number} bad dewa holo.")
 
 
 @bot.message_handler(commands=["nocaption"])
@@ -807,11 +900,12 @@ def no_caption(message):
     if not is_owner(message):
         return deny(message)
     with settings_lock:
-        settings["caption"] = ""
+        settings["captions"] = []
+        settings["caption_index"] = 0
         save_settings()
     bot.reply_to(
         message,
-        "✅ Caption bad dewa holo. Ekhon theke caption chara jabe.",
+        "✅ Shob caption bad dewa holo. Ekhon theke caption chara jabe.",
     )
 
 
@@ -1121,7 +1215,10 @@ def screen_main():
     if items:
         lines.append(f"⏭ Porer post: {pretty_time(parse_time(items[0]['time']))}")
     lines.append(f"🕒 Slot: {format_slots()}")
-    lines.append("📝 Caption: " + ("ache" if get_caption() else "nai"))
+    caption_count = len(get_captions())
+    lines.append(
+        f"📝 Caption: {caption_count} ta" if caption_count else "📝 Caption: nai"
+    )
     lines.append("\nPost forward korun ba Instagram/Facebook link pathan.")
     kb = types.InlineKeyboardMarkup()
     kb.row(btn("📅 Queue", "q:l:0"), btn("🕒 Slots", "s:list"))
@@ -1140,9 +1237,10 @@ def screen_help():
         "• <b>Queue</b>: post-e tap kore somoy bodlan, ekhoni post korun, "
         "ba bad den.\n"
         "• <b>Slots</b>: daily upload-er somoy add ba bad den.\n"
-        "• <b>Caption</b>: video-te shob shomoy apnar set kora caption jabe "
-        "(forward kora video-r nijer caption jabe na). Photo ba onno post-e "
-        "nijer caption thakle sheta jabe."
+        "• <b>Caption</b>: ekadhik caption jog korte paren. Video-te caption "
+        "serial onujayi jabe (1 number, tarpor 2 number...). Forward kora "
+        "video-r nijer caption jabe na. Photo ba onno post-e nijer caption "
+        "thakle sheta jabe."
     )
     return text, kb
 
@@ -1274,22 +1372,28 @@ def screen_slot_del():
 
 
 def screen_caption():
-    current = get_caption()
-    kb = types.InlineKeyboardMarkup()
-    if current:
+    caps = get_captions()
+    kb = types.InlineKeyboardMarkup(row_width=5)
+    if caps:
         text = (
-            "📝 <b>Ekhon caption:</b>\n\n" + html.escape(current) + "\n\n"
-            "Video-te shob shomoy ei caption jabe. Photo ba onno post-e "
-            "nijer caption thakle sheta jabe."
+            "📝 <b>Caption list</b> (serial onujayi, ekta ekta kore):\n\n"
+            + format_captions()
+            + "\n\n➡️ = porer video-te ei caption jabe.\n"
+            "Photo ba onno post-e nijer caption thakle sheta jabe."
         )
-        kb.row(btn("✏️ Caption bodlan", "c:set"), btn("🗑 Bad den", "c:off"))
+        kb.row(btn("➕ Caption add", "c:set"))
+        kb.add(*[btn(f"🗑 {n}", f"c:del:{n}") for n in range(1, len(caps) + 1)])
+        kb.row(
+            btn("🔄 1 number theke shuru", "c:reset"),
+            btn("🗑 Shob bad den", "c:off"),
+        )
     else:
         text = (
             "📝 Ekhon kono caption nai.\n\n"
-            "Caption set korle video-te shob shomoy sheta jabe. Photo ba "
-            "onno post-e nijer caption thakle sheta jabe."
+            "Caption add korle video-te serial onujayi jabe. Photo ba onno "
+            "post-e nijer caption thakle sheta jabe."
         )
-        kb.row(btn("✏️ Caption set korun", "c:set"))
+        kb.row(btn("➕ Caption add", "c:set"))
     kb.row(*home_row())
     return text, kb
 
@@ -1355,10 +1459,16 @@ def apply_pending_caption(message) -> None:
         bot.reply_to(message, "❌ Caption 1024 akhor-er moddhe rakhen. Abar pathan.")
         return
     with settings_lock:
-        settings["caption"] = text
-        save_settings()
+        full = len(settings["captions"]) >= MAX_CAPTIONS
+        if not full:
+            settings["captions"].append(text)
+            total = len(settings["captions"])
+            save_settings()
     pending.clear()
-    bot.reply_to(message, "✅ Caption set hoyeche.")
+    if full:
+        bot.reply_to(message, f"❌ Shorbocho {MAX_CAPTIONS} ta caption rakha jay.")
+    else:
+        bot.reply_to(message, f"✅ Caption #{total} jog hoyeche.")
     send_screen(message.chat.id, screen_caption())
 
 
@@ -1471,14 +1581,37 @@ def on_callback(call):
                 kb.row(btn("❌ Bondho koren", "p:cancel"))
                 bot.send_message(
                     msg.chat.id,
-                    "✏️ Notun caption likhe pathan:",
+                    "✏️ Notun caption likhe pathan (ekta ekta kore jog hobe):",
                     reply_markup=kb,
                 )
             elif parts[1] == "off":
                 with settings_lock:
-                    settings["caption"] = ""
+                    settings["captions"] = []
+                    settings["caption_index"] = 0
                     save_settings()
-                toast = "🗑 Caption bad dewa holo"
+                toast = "🗑 Shob caption bad dewa holo"
+                render(msg, screen_caption())
+            elif parts[1] == "del":
+                number = int(parts[2])
+                with settings_lock:
+                    caps = settings["captions"]
+                    if 1 <= number <= len(caps):
+                        caps.pop(number - 1)
+                        if settings["caption_index"] > number - 1:
+                            settings["caption_index"] -= 1
+                        settings["caption_index"] = (
+                            settings["caption_index"] % len(caps) if caps else 0
+                        )
+                        save_settings()
+                        toast = f"🗑 Caption #{number} bad dewa holo"
+                    else:
+                        toast = "⚠️ Ei caption ar nai"
+                render(msg, screen_caption())
+            elif parts[1] == "reset":
+                with settings_lock:
+                    settings["caption_index"] = 0
+                    save_settings()
+                toast = "🔄 Ekhon theke 1 number caption theke shuru"
                 render(msg, screen_caption())
 
         elif key == "b":
@@ -1560,7 +1693,7 @@ def schedule_post(message) -> None:
         if entry.get("orig_caption"):
             note = "\n(post-er nijer caption jabe)"
         elif get_caption():
-            note = "\n(apnar set kora caption jabe)"
+            note = "\n(apnar caption list theke serial onujayi jabe)"
         else:
             note = "\n(caption jabe na)"
     bot.reply_to(
