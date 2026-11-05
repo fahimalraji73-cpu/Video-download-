@@ -24,14 +24,26 @@ def load_json(name):
         if res.data:
             return res.data[0]["data"]
     except Exception as e:
-        logging.error(f"Supabase load error ({name}): {e}")
+        logging.error(f"❌ Supabase LOAD error ({name}): {e}")
     return None
 
 def save_json(name, data):
     try:
-        supabase.table(TABLE).upsert({"key": name, "data": data}).execute()
+        # ডেটা যেনো ঠিকমতো JSON এ কনভার্ট হয়
+        clean_data = json.loads(json.dumps(data))
+        # স্পেসিফিক key এর ওপর আপডেট হবে
+        supabase.table(TABLE).upsert(
+            {
+                "key": name, 
+                "data": clean_data, 
+                "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
+            }, 
+            on_conflict="key"
+        ).execute()
+        return True
     except Exception as e:
-        logging.error(f"Supabase save error ({name}): {e}")
+        logging.error(f"❌ Supabase SAVE error ({name}): {e}")
+        return False
 
 # ---------- Config ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -193,7 +205,10 @@ def channel_caption_info(cid):
         return idx, ch["captions"][idx]
 
 def format_channel_slots(cid):
-    return ", ".join(datetime.strptime(s, "%H:%M").strftime("%I:%M %p").lstrip("0") for s in channels.get(cid, {}).get("slots", []))
+    with channels_lock:
+        ch = channels.get(cid)
+        if not ch: return ""
+        return ", ".join(datetime.strptime(s, "%H:%M").strftime("%I:%M %p").lstrip("0") for s in ch["slots"])
 
 def format_channel_captions(cid):
     caps = channel_captions(cid); info = channel_caption_info(cid); lines = []
@@ -654,6 +669,17 @@ def open_menu(m):
     bot.send_message(m.chat.id, "👋 Button diye shob kichu.\nPost forward ba link pathan.",
                      reply_markup=reply_keyboard())
     send_screen(m.chat.id, screen_main(m.from_user.id))
+
+@bot.message_handler(commands=["testdb"])
+def test_db(m):
+    if not is_owner_message(m): return deny(m)
+    if save_json("test_ping", {"status": "ok", "time": now_local().isoformat()}):
+        if load_json("test_ping"):
+            bot.reply_to(m, "✅ Supabase 100% ঠিক আছে! ডেটা সেভ এবং লোড হচ্ছে।")
+        else:
+            bot.reply_to(m, "⚠️ সেভ হয়েছে কিন্তু লোড হচ্ছে না।")
+    else:
+        bot.reply_to(m, "❌ সেভ হচ্ছে না! Render-এর লগ চেক করুন।")
 
 @bot.message_handler(commands=["channels"])
 def channels_cmd(m):
