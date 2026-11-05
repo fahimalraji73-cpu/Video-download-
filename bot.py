@@ -29,9 +29,7 @@ def load_json(name):
 
 def save_json(name, data):
     try:
-        # ডেটা যেনো ঠিকমতো JSON এ কনভার্ট হয়
         clean_data = json.loads(json.dumps(data))
-        # স্পেসিফিক key এর ওপর আপডেট হবে
         supabase.table(TABLE).upsert(
             {
                 "key": name, 
@@ -114,8 +112,13 @@ def parse_slot_list(text: str) -> list:
     if not slots: raise ValueError("empty")
     return sorted(slots)
 
+# ---------- Locks (Fixed Deadlock using RLock) ----------
+channels_lock = threading.RLock()
+admins_lock = threading.RLock()
+queue_lock = threading.RLock()
+download_lock = threading.RLock()
+
 # ---------- Channels ----------
-channels_lock = threading.Lock()
 channels = {}
 active_channels = {}
 
@@ -267,7 +270,6 @@ def remove_slot_value(cid, hhmm):
     return "ok"
 
 # ---------- Admins ----------
-admins_lock = threading.Lock()
 admins = set()
 
 def load_admins():
@@ -285,7 +287,6 @@ def is_admin(uid):
     with admins_lock: return uid == OWNER_ID or uid in admins
 
 # ---------- Queue ----------
-queue_lock = threading.Lock()
 def now_local(): return datetime.now(TZ)
 def parse_time(v): return datetime.fromisoformat(v)
 
@@ -946,7 +947,6 @@ def handle_channel_post(m):
     if urls: start_bulk(OWNER_ID, urls)
 
 # ---------- Bulk Downloader ----------
-download_lock = threading.Lock()
 bulk_jobs = {}
 
 def normalize_url(url):
