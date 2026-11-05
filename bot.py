@@ -6,6 +6,33 @@ import yt_dlp
 from flask import Flask, request
 from telebot import types
 
+# ---------- Supabase Setup ----------
+from supabase import create_client, Client
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+TABLE = "bot_storage"
+
+def load_json(name):
+    try:
+        res = supabase.table(TABLE).select("data").eq("key", name).execute()
+        if res.data:
+            return res.data[0]["data"]
+    except Exception as e:
+        logging.error(f"Supabase load error ({name}): {e}")
+    return None
+
+def save_json(name, data):
+    try:
+        supabase.table(TABLE).upsert({"key": name, "data": data}).execute()
+    except Exception as e:
+        logging.error(f"Supabase save error ({name}): {e}")
+
 # ---------- Config ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -20,11 +47,6 @@ TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Dhaka"))
 PORT = int(os.environ.get("PORT", 10000))
 
 DOWNLOAD_DIR = "downloads"
-QUEUE_FILE = "queue.json"
-CHANNELS_FILE = "channels.json"
-ADMINS_FILE = "admins.json"
-ACTIVE_FILE = "active_channel.json"
-SETTINGS_FILE = "settings.json"
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_ATTEMPTS = 3
 RETRY_DELAY_MIN = 5
@@ -82,8 +104,8 @@ def parse_slot_list(text: str) -> list:
 
 # ---------- Channels ----------
 channels_lock = threading.Lock()
-channels = {}   # channel_id -> {id,title,slots,captions,caption_index}
-active_channels = {}  # user_id -> channel_id
+channels = {}
+active_channels = {}
 
 def new_channel_entry(cid, title=""):
     return {
@@ -94,50 +116,27 @@ def new_channel_entry(cid, title=""):
     }
 
 def save_channels():
-    tmp = CHANNELS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(list(channels.values()), f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CHANNELS_FILE)
+    with channels_lock:
+        save_json("channels", list(channels.values()))
 
 def load_channels():
     global channels
+    data_list = load_json("channels")
     data = {}
-    if os.path.exists(CHANNELS_FILE):
-        try:
-            with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
-                for ch in json.load(f): data[ch["id"]] = ch
-        except Exception as exc: log.error("channels read: %s", exc)
-    if not data and os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f: old = json.load(f)
-            slots = old.get("slots") or parse_slot_list(DEFAULT_SLOTS)
-            caps = old.get("captions")
-            if caps is None:
-                legacy = old.get("caption")
-                caps = [legacy] if legacy else [c.strip() for c in DEFAULT_CAPTION.split("||") if c.strip()]
-            data[DEFAULT_CHANNEL] = {"id": DEFAULT_CHANNEL, "title": DEFAULT_CHANNEL,
-                "slots": slots, "captions": [c for c in caps if c],
-                "caption_index": int(old.get("caption_index", 0) or 0)}
-            log.info("Migrated settings.json -> channels.json")
-        except Exception as exc: log.error("migration: %s", exc)
-    if not data: data[DEFAULT_CHANNEL] = new_channel_entry(DEFAULT_CHANNEL)
+    if isinstance(data_list, list):
+        for ch in data_list: data[ch["id"]] = ch
+    if not data: 
+        data[DEFAULT_CHANNEL] = new_channel_entry(DEFAULT_CHANNEL)
     channels = data
     save_channels()
 
 def load_active():
     global active_channels
-    active_channels = {}
-    if os.path.exists(ACTIVE_FILE):
-        try:
-            with open(ACTIVE_FILE, "r", encoding="utf-8") as f:
-                for k, v in json.load(f).items(): active_channels[int(k)] = v
-        except Exception as exc: log.error("active read: %s", exc)
+    data = load_json("active_channel")
+    active_channels = {int(k): v for k, v in data.items()} if isinstance(data, dict) else {}
 
 def save_active():
-    tmp = ACTIVE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({str(k): v for k, v in active_channels.items()}, f, indent=2)
-    os.replace(tmp, ACTIVE_FILE)
+    save_json("active_channel", {str(k): v for k, v in active_channels.items()})
 
 def get_active_channel_id(uid):
     with channels_lock:
@@ -146,8 +145,7 @@ def get_active_channel_id(uid):
         if channels:
             first = next(iter(channels.keys()))
             active_channels[uid] = first
-            try: save_active()
-            except Exception: pass
+            save_active()
             return first
         return None
 
@@ -158,12 +156,10 @@ def get_active_channel(uid):
 def set_active_channel(uid, cid):
     with channels_lock:
         if cid in channels:
-            active_channels[uid] = cid; save_active(); return True
+            active_channels[uid] = cid
+            save_active()
+            return True
         return False
-
-def channel_slots(cid):
-    with channels_lock:
-        ch = channels.get(cid); return list(ch["slots"]) if ch else []
 
 def channel_slot_times(cid):
     with channels_lock:
@@ -173,7 +169,8 @@ def channel_slot_times(cid):
 
 def channel_captions(cid):
     with channels_lock:
-        ch = channels.get(cid); return list(ch["captions"]) if ch else []
+        ch = channels.get(cid)
+        return list(ch["captions"]) if ch else []
 
 def get_channel_caption(cid):
     with channels_lock:
@@ -196,7 +193,7 @@ def channel_caption_info(cid):
         return idx, ch["captions"][idx]
 
 def format_channel_slots(cid):
-    return ", ".join(datetime.strptime(s, "%H:%M").strftime("%I:%M %p").lstrip("0") for s in channel_slots(cid))
+    return ", ".join(datetime.strptime(s, "%H:%M").strftime("%I:%M %p").lstrip("0") for s in channels.get(cid, {}).get("slots", []))
 
 def format_channel_captions(cid):
     caps = channel_captions(cid); info = channel_caption_info(cid); lines = []
@@ -260,17 +257,13 @@ admins = set()
 
 def load_admins():
     global admins
-    admins = set()
-    if os.path.exists(ADMINS_FILE):
-        try:
-            with open(ADMINS_FILE, "r", encoding="utf-8") as f: admins = set(json.load(f))
-        except Exception as exc: log.error("admins read: %s", exc)
+    data = load_json("admins")
+    admins = set(data) if isinstance(data, list) else set()
     admins.add(OWNER_ID)
 
 def save_admins():
-    tmp = ADMINS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f: json.dump(sorted(admins), f, indent=2)
-    os.replace(tmp, ADMINS_FILE)
+    with admins_lock:
+        save_json("admins", sorted(admins))
 
 def is_owner(uid): return uid == OWNER_ID
 def is_admin(uid):
@@ -282,20 +275,17 @@ def now_local(): return datetime.now(TZ)
 def parse_time(v): return datetime.fromisoformat(v)
 
 def load_queue():
-    if not os.path.exists(QUEUE_FILE): return []
-    try:
-        with open(QUEUE_FILE, "r", encoding="utf-8") as f: items = json.load(f)
-    except Exception as exc: log.error("queue read: %s", exc); return []
+    data = load_json("queue")
+    if not isinstance(data, list): return []
     with channels_lock: default_ch = next(iter(channels.keys())) if channels else DEFAULT_CHANNEL
-    for i in items:
+    for i in data:
         if "channel" not in i: i["channel"] = default_ch
-    return items
+    return data
 
 def save_queue(items):
-    items.sort(key=lambda i: i["time"])
-    tmp = QUEUE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f: json.dump(items, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, QUEUE_FILE)
+    with queue_lock:
+        items.sort(key=lambda i: i["time"])
+        save_json("queue", items)
 
 def next_free_slot(items, cid):
     taken = {parse_time(i["time"]) for i in items if i.get("channel") == cid}
@@ -352,7 +342,7 @@ def reschedule_affected(removed, cid):
         save_queue(other + keep)
     return len(moved)
 
-# ---------- Download ----------
+# ---------- Download & Posting ----------
 def download_video(url):
     fid = uuid.uuid4().hex
     tmpl = os.path.join(DOWNLOAD_DIR, f"{fid}.%(ext)s")
@@ -377,7 +367,6 @@ def notify_owner(text):
     try: bot.send_message(OWNER_ID, text)
     except Exception as exc: log.error("notify owner: %s", exc)
 
-# ---------- Posting ----------
 def build_caption_kw(cid):
     cap = get_channel_caption(cid)
     if not cap: return {}
@@ -482,398 +471,6 @@ def extract_media(m):
     if m.video_note: x = m.video_note; return "video_note", x.file_id, x.file_unique_id, "⭕ Video note"
     if m.sticker: x = m.sticker; return "sticker", x.file_id, x.file_unique_id, "🏷 Sticker"
     return None
-
-# ---------- Commands ----------
-@bot.message_handler(commands=["help"])
-def send_welcome(m):
-    if not is_admin_message(m): return deny(m)
-    bot.reply_to(m,
-        "👋 <b>Welcome!</b>\n\n"
-        "Post forward korun ba Instagram/Facebook link pathan — apnar "
-        "<b>active channel</b> er porer khali slot e upload hobe.\n\n"
-        "/menu - shob kichu button diye\n"
-        "/channels - channel list & select\n"
-        "/addchannel @name Title - notun channel (owner)\n"
-        "/delchannel @name - channel bad (owner)\n\n"
-        "<b>Admin (owner only)</b>\n"
-        "/admins - admin list\n"
-        "/addadmin USER_ID - admin add\n"
-        "/deladmin USER_ID - admin bad\n\n"
-        "<b>Queue</b>: /queue /cancel N /clear\n"
-        "<b>Slot</b>: /slots /setslots /addslot /delslot /settime\n"
-        "<b>Caption</b>: /caption /caption text /delcaption N /nocaption\n"
-        "<i>Caption gulo channel e <b>bold</b> hoye jabe.</i>"
-    )
-
-# ---- Queue commands ----
-@bot.message_handler(commands=["queue"])
-def show_queue(m):
-    if not is_admin_message(m): return deny(m)
-    cid = get_active_channel_id(m.from_user.id)
-    with queue_lock: items = [i for i in load_queue() if i.get("channel") == cid]
-    if not items: bot.reply_to(m, "📭 Queue khali."); return
-    lines = [f"📅 <b>{html.escape(str(cid))}</b> — Schedule:\n"]
-    for n, it in enumerate(items, start=1):
-        lines.append(f"{n}. {pretty_time(parse_time(it['time']))}\n{html.escape(item_label(it))}")
-    reply_long(m, lines)
-
-@bot.message_handler(commands=["cancel"])
-def cancel_item(m):
-    if not is_admin_message(m): return deny(m)
-    parts = m.text.split()
-    if len(parts) < 2 or not parts[1].isdigit(): return bot.reply_to(m, "Likhen: /cancel 2")
-    idx = int(parts[1]); cid = get_active_channel_id(m.from_user.id)
-    with queue_lock:
-        items = [i for i in load_queue() if i.get("channel") == cid]
-        all_items = load_queue()
-        if idx < 1 or idx > len(items): return bot.reply_to(m, "❌ Ei number e kichu nai.")
-        target = items[idx - 1]
-        all_items = [i for i in all_items if i["id"] != target["id"]]
-        save_queue(all_items)
-    bot.reply_to(m, f"🗑 Bad: {html.escape(item_label(target))}", disable_web_page_preview=True)
-
-@bot.message_handler(commands=["clear"])
-def clear_queue(m):
-    if not is_admin_message(m): return deny(m)
-    cid = get_active_channel_id(m.from_user.id)
-    with queue_lock:
-        all_items = load_queue()
-        keep = [i for i in all_items if i.get("channel") != cid]
-        removed = len(all_items) - len(keep)
-        save_queue(keep)
-    bot.reply_to(m, f"🗑 {removed} ta post bad dewa holo ({cid}).")
-
-# ---- Slot commands ----
-@bot.message_handler(commands=["slots"])
-def show_slots(m):
-    if not is_admin_message(m): return deny(m)
-    cid = get_active_channel_id(m.from_user.id)
-    bot.reply_to(m, f"🕒 <b>{html.escape(str(cid))}</b> — Daily slot:\n{format_channel_slots(cid)}\n\n"
-        "/setslots /addslot /delslot diye poriborton korun.")
-
-@bot.message_handler(commands=["setslots"])
-def set_slots(m):
-    if not is_admin_message(m): return deny(m)
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2: return bot.reply_to(m, "Likhen: /setslots 08:00,12:00,18:00")
-    try: slots = parse_slot_list(parts[1])
-    except ValueError: return bot.reply_to(m, "❌ Format thik na.")
-    cid = get_active_channel_id(m.from_user.id)
-    with channels_lock:
-        ch = channels.get(cid)
-        if ch: ch["slots"] = slots; save_channels()
-    reschedule_all(cid)
-    bot.reply_to(m, f"✅ Notun slot: {format_channel_slots(cid)}\nQueue re-shajano hoyeche.")
-
-@bot.message_handler(commands=["addslot"])
-def add_slot_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2: return bot.reply_to(m, "Likhen: /addslot 10:00")
-    try: new = parse_slot_list(parts[1])
-    except ValueError: return bot.reply_to(m, "❌ Format thik na.")
-    cid = get_active_channel_id(m.from_user.id); added = False
-    for s in new:
-        if add_slot_value(cid, s): added = True
-    bot.reply_to(m, f"{'✅ Add hoyeche.' if added else '⚠️ Ei slot agei ache.'}\n🕒 {format_channel_slots(cid)}")
-
-@bot.message_handler(commands=["delslot", "removeslot"])
-def delete_slot_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2: return bot.reply_to(m, "Likhen: /delslot 10:00")
-    try: rem = parse_slot_list(parts[1])
-    except ValueError: return bot.reply_to(m, "❌ Format thik na.")
-    cid = get_active_channel_id(m.from_user.id); err = None; moved = 0
-    for s in rem:
-        r = remove_slot_value(cid, s)
-        if r == "last": err = "❌ Shesh slot ta bad deya jabe na."
-        elif r == "missing": pass
-        else: moved += reschedule_affected([s], cid)
-    if err: return bot.reply_to(m, err)
-    bot.reply_to(m, f"✅ Slot bad dewa holo.\n🕒 {format_channel_slots(cid)}"
-                     + (f"\n{moved} ta post porer slot e gelo." if moved else ""))
-
-@bot.message_handler(commands=["settime"])
-def set_time_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    parts = m.text.split()
-    mo = re.fullmatch(r"(\d{1,2}):(\d{2})", parts[2]) if len(parts) >= 3 else None
-    if len(parts) < 3 or not parts[1].isdigit() or not mo:
-        return bot.reply_to(m, "Likhen: /settime 2 17:30")
-    h, mi = int(mo.group(1)), int(mo.group(2))
-    if h > 23 or mi > 59: return bot.reply_to(m, "❌ Somoy thik na.")
-    idx = int(parts[1]); cid = get_active_channel_id(m.from_user.id)
-    with queue_lock:
-        all_items = load_queue()
-        mine = [i for i in all_items if i.get("channel") == cid]
-        if idx < 1 or idx > len(mine): return bot.reply_to(m, "❌ Number nai.")
-        target = mine[idx - 1]; now = now_local()
-        tgt = datetime.combine(now.date(), dtime(h, mi), tzinfo=TZ)
-        if tgt <= now: tgt += timedelta(days=1)
-        for i in all_items:
-            if i["id"] == target["id"]:
-                i["time"] = tgt.isoformat(); i.pop("next_try", None); break
-        save_queue(all_items)
-    bot.reply_to(m, f"✅ {idx} number post jabe: <b>{pretty_time(tgt)}</b>")
-
-# ---- Caption commands ----
-@bot.message_handler(commands=["caption"])
-def caption_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    cid = get_active_channel_id(m.from_user.id)
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
-        if channel_captions(cid):
-            bot.reply_to(m, f"📝 <b>{html.escape(str(cid))}</b> — Caption list:\n\n"
-                + format_channel_captions(cid)
-                + "\n\n➡️ = porer video-te ei caption jabe (bold hoye).\n"
-                  "/caption text, /delcaption N, /nocaption")
-        else:
-            bot.reply_to(m, "📝 Kono caption nai.\n/caption Amar caption")
-        return
-    text = parts[1].strip()
-    if len(text) > 1024: return bot.reply_to(m, "❌ 1024 akhor max.")
-    ok, info = add_caption(cid, text)
-    if not ok:
-        msg = "❌ Shorbocho 30 ta caption." if info == "limit" else "❌ Channel nai."
-        return bot.reply_to(m, msg)
-    bot.reply_to(m, f"✅ Caption #{info} jog. Total {info} ta (bold hoye jabe).")
-
-@bot.message_handler(commands=["delcaption"])
-def delcaption_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    parts = m.text.split()
-    if len(parts) < 2 or not parts[1].isdigit(): return bot.reply_to(m, "Likhen: /delcaption 2")
-    cid = get_active_channel_id(m.from_user.id)
-    if remove_caption(cid, int(parts[1])): bot.reply_to(m, f"🗑 Caption #{parts[1]} bad.")
-    else: bot.reply_to(m, "❌ Number nai.")
-
-@bot.message_handler(commands=["nocaption"])
-def nocaption_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    clear_captions(get_active_channel_id(m.from_user.id))
-    bot.reply_to(m, "✅ Shob caption bad dewa holo.")
-
-# ---- Admin management (owner only) ----
-@bot.message_handler(commands=["admins"])
-def list_admins(m):
-    if not is_owner_message(m): return deny(m)
-    with admins_lock: lst = sorted(admins)
-    lines = ["👥 <b>Admins:</b>\n"]
-    for uid in lst:
-        tag = "👑 Owner" if uid == OWNER_ID else "👤 Admin"
-        lines.append(f"{tag} — <code>{uid}</code>")
-    reply_long(m, lines)
-
-@bot.message_handler(commands=["addadmin"])
-def add_admin_cmd(m):
-    if not is_owner_message(m): return deny(m)
-    parts = m.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        return bot.reply_to(m, "Likhen: /addadmin 123456789")
-    uid = int(parts[1])
-    with admins_lock:
-        if uid in admins: return bot.reply_to(m, "⚠️ Ei user agei admin.")
-        admins.add(uid); save_admins()
-    bot.reply_to(m, f"✅ Admin add hoyeche: <code>{uid}</code>")
-
-@bot.message_handler(commands=["deladmin"])
-def del_admin_cmd(m):
-    if not is_owner_message(m): return deny(m)
-    parts = m.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        return bot.reply_to(m, "Likhen: /deladmin 123456789")
-    uid = int(parts[1])
-    if uid == OWNER_ID: return bot.reply_to(m, "❌ Owner ke bad deya jabe na.")
-    with admins_lock:
-        if uid not in admins: return bot.reply_to(m, "⚠️ Ei user admin na.")
-        admins.discard(uid); save_admins()
-    bot.reply_to(m, f"🗑 Admin bad: <code>{uid}</code>")
-
-# ---- Channel management ----
-@bot.message_handler(commands=["channels"])
-def channels_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    uid = m.from_user.id
-    active = get_active_channel_id(uid)
-    lines = ["📡 <b>Channels:</b>\n"]
-    with channels_lock:
-        for i, (cid, ch) in enumerate(channels.items(), start=1):
-            mark = "✅" if cid == active else "  "
-            lines.append(f"{mark} <b>{i}.</b> {html.escape(ch['title'])} — <code>{html.escape(cid)}</code>")
-    lines.append("\n/channel 1 diye select korun.")
-    bot.reply_to(m, "\n".join(lines))
-
-@bot.message_handler(commands=["channel"])
-def channel_select_cmd(m):
-    if not is_admin_message(m): return deny(m)
-    parts = m.text.split()
-    if len(parts) < 2: return bot.reply_to(m, "/channel 1 ba /channel @name")
-    with channels_lock: keys = list(channels.keys())
-    target = parts[1]
-    if target.isdigit():
-        i = int(target) - 1
-        if 0 <= i < len(keys): target = keys[i]
-    if set_active_channel(m.from_user.id, target):
-        ch = channels.get(target, {})
-        bot.reply_to(m, f"✅ Active channel: <b>{html.escape(ch.get('title', target))}</b>")
-    else:
-        bot.reply_to(m, "❌ Ei channel paoa gelo na.")
-
-@bot.message_handler(commands=["addchannel"])
-def add_channel_cmd(m):
-    if not is_owner_message(m): return deny(m)
-    parts = m.text.split(maxsplit=2)
-    if len(parts) < 2: return bot.reply_to(m, "Likhen: /addchannel @name [Title]")
-    raw = parts[1].strip(); title = parts[2].strip() if len(parts) > 2 else ""
-    try:
-        chat = bot.get_chat(raw)
-        real = str(chat.id)
-        title = title or chat.title or real
-        try:
-            bm = bot.get_chat_member(chat.id, bot.get_me().id)
-            if bm.status not in ("administrator", "creator"):
-                return bot.reply_to(m, "❌ Bot ke oi channel e admin banate hobe.")
-        except Exception: pass
-        with channels_lock:
-            if real in channels: return bot.reply_to(m, "⚠️ Ei channel agei add.")
-            channels[real] = new_channel_entry(real, title); save_channels()
-        bot.reply_to(m, f"✅ Channel add: <b>{html.escape(title)}</b>\nID: <code>{real}</code>")
-    except Exception as exc:
-        bot.reply_to(m, f"❌ Channel paoa gelo na: {exc}")
-
-@bot.message_handler(commands=["delchannel"])
-def del_channel_cmd(m):
-    if not is_owner_message(m): return deny(m)
-    parts = m.text.split()
-    if len(parts) < 2: return bot.reply_to(m, "Likhen: /delchannel @name ba /delchannel 2")
-    with channels_lock: keys = list(channels.keys())
-    target = parts[1]
-    if target.isdigit():
-        i = int(target) - 1
-        if 0 <= i < len(keys): target = keys[i]
-    with channels_lock:
-        if target not in channels: return bot.reply_to(m, "❌ Channel nai.")
-        if len(channels) <= 1: return bot.reply_to(m, "❌ Shesh channel ta bad deya jabe na.")
-        removed = channels.pop(target); save_channels()
-        for k, v in list(active_channels.items()):
-            if v == target: active_channels[k] = next(iter(channels.keys())); 
-        save_active()
-    with queue_lock:
-        items = load_queue()
-        keep = [i for i in items if i.get("channel") != target]
-        save_queue(keep)
-    bot.reply_to(m, f"🗑 Channel bad: {html.escape(removed['title'])}")
-
-# ---------- Link handling / bulk ----------
-download_lock = threading.Lock()
-bulk_jobs = {}
-
-def normalize_url(url):
-    url = url.rstrip(".,;:!?)]}>\"'")
-    if "instagram.com" in url.lower(): url = url.split("?")[0].split("#")[0]
-    return url
-
-def send_with_retry(func):
-    for attempt in range(4):
-        try: return func()
-        except telebot.apihelper.ApiTelegramException as exc:
-            if getattr(exc, "error_code", None) == 429 and attempt < 3:
-                wait = 5
-                try: wait = int(exc.result_json["parameters"]["retry_after"]) + 1
-                except Exception: pass
-                log.warning("Flood wait %ss", wait); time.sleep(wait); continue
-            raise
-
-def send_saved_video(chat_id, fp):
-    def _():
-        with open(fp, "rb") as v:
-            return bot.send_video(chat_id, v, caption="💾 Saved.", supports_streaming=True,
-                                  timeout=120, disable_notification=True)
-    return send_with_retry(_)
-
-def process_link(url, cid, user_id):
-    with queue_lock:
-        if any(i.get("url") == url and i.get("channel") == cid for i in load_queue()):
-            return "dup", None
-    fp = None
-    try:
-        with download_lock:
-            fp = download_video(url)
-            if os.path.getsize(fp) > MAX_FILE_SIZE: return "big", None
-            sent = send_saved_video(user_id, fp)
-        if sent.video: kind, media = "video", sent.video
-        else: kind, media = "document", sent.document
-        slot = enqueue({"url": url, "label": url, "kind": kind,
-                        "file_id": media.file_id, "unique_id": media.file_unique_id}, cid)
-        return "ok", slot
-    except yt_dlp.utils.DownloadError as exc:
-        log.warning("DL error %s: %s", url, exc); return "fail", None
-    except Exception as exc:
-        log.exception("Unexpected %s: %s", url, exc); return "fail", None
-    finally: safe_remove(fp)
-
-def run_bulk(user_id, cid, status, urls, job_id, stop):
-    total = len(urls); ok_slots, dup, big, failed = [], 0, 0, []
-    stopped = False; n = 1
-    def stop_markup():
-        kb = types.InlineKeyboardMarkup(); kb.row(types.InlineKeyboardButton("⏹ Bondho", callback_data=f"b:{job_id}")); return kb
-    def edit(text, markup=None):
-        try: bot.edit_message_text(text, chat_id=user_id, message_id=status.message_id,
-                                    reply_markup=markup, disable_web_page_preview=True)
-        except Exception: pass
-    for n, url in enumerate(urls, start=1):
-        if stop.is_set(): stopped = True; break
-        edit(f"⏳ {n}/{total} download...\n✅ {len(ok_slots)} ready  ❌ {len(failed)} fail", stop_markup())
-        r, info = process_link(url, cid, user_id)
-        if r == "ok": ok_slots.append(info)
-        elif r == "dup": dup += 1
-        elif r == "big": big += 1; failed.append(url)
-        else: failed.append(url)
-        time.sleep(1.5)
-    bulk_jobs.pop(job_id, None)
-    if total == 1 and not stopped:
-        if ok_slots: edit(f"✅ Ready. <b>{html.escape(str(cid))}</b> e jabe: <b>{pretty_time(ok_slots[0])}</b>")
-        elif dup: edit("⚠️ Agei queue te ache.")
-        elif big: edit("⚠️ 50 MB boro.")
-        else: edit("❌ Download fail. Private/deleted/unsupported.")
-        return
-    lines = ["🛑 <b>Bondho.</b>" if stopped else "🏁 <b>Shesh!</b>", ""]
-    lines.append(f"✅ Schedule: <b>{len(ok_slots)}</b>")
-    if dup: lines.append(f"⚠️ Duplicate: {dup}")
-    if big: lines.append(f"⚠️ 50MB+: {big}")
-    if len(failed) - big: lines.append(f"❌ Fail: {len(failed) - big}")
-    if stopped: lines.append(f"⏹ Baki: {total - n + 1}")
-    if ok_slots:
-        ok_slots.sort()
-        lines.append(""); lines.append(f"📅 Prothom: {pretty_time(ok_slots[0])}")
-        lines.append(f"📅 Shesh: {pretty_time(ok_slots[-1])}")
-    edit("\n".join(lines))
-    if failed:
-        out = ["❌ Fail gulo:", ""] + [html.escape(u) for u in failed]
-        try: reply_long(status, out)
-        except Exception as exc: log.error("failed list: %s", exc)
-
-def start_bulk(user_id, raw_urls):
-    cid = get_active_channel_id(user_id)
-    if not cid:
-        try: bot.send_message(user_id, "❌ Kono channel nai. /addchannel diye add korun.")
-        except Exception: pass
-        return 0
-    seen, clean = set(), []
-    for raw in raw_urls:
-        u = normalize_url(raw)
-        if u not in seen: seen.add(u); clean.append(u)
-    clean = clean[:100]
-    if not clean: return 0
-    status = bot.send_message(user_id, f"⏳ {len(clean)} ta link paoa gelo → {html.escape(str(cid))}")
-    job_id = uuid.uuid4().hex[:8]; stop = threading.Event(); bulk_jobs[job_id] = stop
-    threading.Thread(target=run_bulk, args=(user_id, cid, status, clean, job_id, stop), daemon=True).start()
-    return len(clean)
-
-def handle_links(m, urls):
-    start_bulk(m.from_user.id, urls)
 
 # ---------- Menu UI ----------
 pending = {}
@@ -1049,14 +646,48 @@ def screen_confirm_clear(uid):
     kb.row(btn("✅ Hya", "x:yes"), btn("❌ Na", "m:main"))
     return f"⚠️ {cid} er {cnt} ta post bad hobe. Nishchit?", kb
 
-# ---------- Entry points ----------
-@bot.message_handler(commands=["start", "menu"])
+# ---------- Bot Handlers ----------
+@bot.message_handler(commands=["help", "start", "menu"])
 def open_menu(m):
     if not is_admin_message(m): return deny(m)
     pending.clear()
     bot.send_message(m.chat.id, "👋 Button diye shob kichu.\nPost forward ba link pathan.",
                      reply_markup=reply_keyboard())
     send_screen(m.chat.id, screen_main(m.from_user.id))
+
+@bot.message_handler(commands=["channels"])
+def channels_cmd(m):
+    if not is_admin_message(m): return deny(m)
+    send_screen(m.chat.id, screen_channels(m.from_user.id))
+
+@bot.message_handler(commands=["admins"])
+def list_admins(m):
+    if not is_owner_message(m): return deny(m)
+    with admins_lock: lst = sorted(admins)
+    lines = ["👥 <b>Admins:</b>\n"]
+    for uid in lst:
+        tag = "👑 Owner" if uid == OWNER_ID else "👤 Admin"
+        lines.append(f"{tag} — <code>{uid}</code>")
+    reply_long(m, lines)
+
+@bot.message_handler(commands=["addadmin", "deladmin"])
+def manage_admin(m):
+    if not is_owner_message(m): return deny(m)
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        return bot.reply_to(m, "Likhen: /addadmin 123456789")
+    uid = int(parts[1])
+    is_add = m.text.startswith("/addadmin")
+    with admins_lock:
+        if is_add:
+            if uid in admins: return bot.reply_to(m, "⚠️ Agei admin.")
+            admins.add(uid); save_admins()
+            bot.reply_to(m, f"✅ Admin add: <code>{uid}</code>")
+        else:
+            if uid == OWNER_ID: return bot.reply_to(m, "❌ Owner bad jabe na.")
+            if uid not in admins: return bot.reply_to(m, "⚠️ Admin na.")
+            admins.discard(uid); save_admins()
+            bot.reply_to(m, f"🗑 Admin bad: <code>{uid}</code>")
 
 def handle_menu_text(m):
     uid = m.from_user.id
@@ -1067,8 +698,7 @@ def handle_menu_text(m):
 
 def apply_pending_caption(m):
     text = m.text.strip()
-    if len(text) > 1024:
-        return bot.reply_to(m, "❌ 1024 akhor max.")
+    if len(text) > 1024: return bot.reply_to(m, "❌ 1024 akhor max.")
     cid = get_active_channel_id(m.from_user.id)
     ok, info = add_caption(cid, text); pending.clear()
     if not ok: bot.reply_to(m, "❌ Caption add fail.")
@@ -1094,7 +724,6 @@ def apply_pending_channel(m):
         send_screen(m.chat.id, screen_channels(m.from_user.id))
     except Exception as exc: bot.reply_to(m, f"❌ {exc}")
 
-# ---------- Callback handler ----------
 @bot.callback_query_handler(func=lambda call: True)
 def on_callback(call):
     if not is_admin(call.from_user.id):
@@ -1131,7 +760,6 @@ def on_callback(call):
                 items = [i for i in load_queue() if not i["id"].startswith(parts[1])]
                 save_queue(items)
             toast = "🗑 Bad"; render(msg, screen_queue(uid, 0))
-        # Slots
         elif key == "s":
             if parts[1] == "list": render(msg, screen_slots(uid))
             elif parts[1] == "add": render(msg, screen_hours(uid))
@@ -1149,7 +777,6 @@ def on_callback(call):
             elif r == "last": toast = "❌ Shesh slot bad jabe na"
             else: toast = "⚠️ Nai"
             render(msg, screen_slots(uid))
-        # Captions
         elif key == "c":
             if parts[1] == "show": render(msg, screen_caption(uid))
             elif parts[1] == "set":
@@ -1163,7 +790,6 @@ def on_callback(call):
                 else: toast = "⚠️ Nai"
                 render(msg, screen_caption(uid))
             elif parts[1] == "reset": reset_caption_index(cid); toast = "🔄 Reset"; render(msg, screen_caption(uid))
-        # Channel
         elif key == "ch":
             if parts[1] == "list": render(msg, screen_channels(uid))
             elif parts[1] == "set":
@@ -1184,8 +810,6 @@ def on_callback(call):
             elif parts[1] == "del":
                 if not is_owner(uid): toast = "❌ Owner only"
                 else: render(msg, screen_channel_del(uid))
-        elif key == "sd" and len(parts) == 3:
-            pass
         elif key == "b":
             ev = bulk_jobs.get(parts[1])
             if ev: ev.set(); toast = "⏹ Stop cholche"
@@ -1200,7 +824,6 @@ def on_callback(call):
                     items = [i for i in load_queue() if i.get("channel") != cid]
                     save_queue(items)
                 toast = "🗑 Clear"; render(msg, screen_main(uid))
-        # Channel delete via ch:del:IDX
         elif key == "ch" and parts[1] == "del" and len(parts) >= 3:
             if not is_owner(uid): toast = "❌ Owner only"
             else:
@@ -1227,7 +850,6 @@ def on_callback(call):
         try: bot.answer_callback_query(call.id, toast)
         except Exception: pass
 
-# ---------- Forwarded posts ----------
 def schedule_post(m):
     media = extract_media(m); cid = get_active_channel_id(m.from_user.id)
     if media:
@@ -1266,7 +888,7 @@ def handle_any(m):
         if m.text.startswith("/"):
             bot.reply_to(m, "❓ Command bujhini. /help dekhen."); return
         urls = URL_PATTERN.findall(m.text)
-        if urls: handle_links(m, urls)
+        if urls: start_bulk(m.from_user.id, urls)
         else: bot.reply_to(m, "Instagram/Facebook link pathan, ba post forward korun.")
         return
     schedule_post(m)
@@ -1296,6 +918,112 @@ def handle_channel_post(m):
     if str(chat.id) != INBOX_CHANNEL_ID: return
     urls = URL_PATTERN.findall(m.text or "")
     if urls: start_bulk(OWNER_ID, urls)
+
+# ---------- Bulk Downloader ----------
+download_lock = threading.Lock()
+bulk_jobs = {}
+
+def normalize_url(url):
+    url = url.rstrip(".,;:!?)]}>\"'")
+    if "instagram.com" in url.lower(): url = url.split("?")[0].split("#")[0]
+    return url
+
+def send_with_retry(func):
+    for attempt in range(4):
+        try: return func()
+        except telebot.apihelper.ApiTelegramException as exc:
+            if getattr(exc, "error_code", None) == 429 and attempt < 3:
+                wait = 5
+                try: wait = int(exc.result_json["parameters"]["retry_after"]) + 1
+                except Exception: pass
+                log.warning("Flood wait %ss", wait); time.sleep(wait); continue
+            raise
+
+def send_saved_video(chat_id, fp):
+    def _():
+        with open(fp, "rb") as v:
+            return bot.send_video(chat_id, v, caption="💾 Saved.", supports_streaming=True,
+                                  timeout=120, disable_notification=True)
+    return send_with_retry(_)
+
+def process_link(url, cid, user_id):
+    with queue_lock:
+        if any(i.get("url") == url and i.get("channel") == cid for i in load_queue()):
+            return "dup", None
+    fp = None
+    try:
+        with download_lock:
+            fp = download_video(url)
+            if os.path.getsize(fp) > MAX_FILE_SIZE: return "big", None
+            sent = send_saved_video(user_id, fp)
+        if sent.video: kind, media = "video", sent.video
+        else: kind, media = "document", sent.document
+        slot = enqueue({"url": url, "label": url, "kind": kind,
+                        "file_id": media.file_id, "unique_id": media.file_unique_id}, cid)
+        return "ok", slot
+    except yt_dlp.utils.DownloadError as exc:
+        log.warning("DL error %s: %s", url, exc); return "fail", None
+    except Exception as exc:
+        log.exception("Unexpected %s: %s", url, exc); return "fail", None
+    finally: safe_remove(fp)
+
+def run_bulk(user_id, cid, status, urls, job_id, stop):
+    total = len(urls); ok_slots, dup, big, failed = [], 0, 0, []
+    stopped = False; n = 1
+    def stop_markup():
+        kb = types.InlineKeyboardMarkup(); kb.row(types.InlineKeyboardButton("⏹ Bondho", callback_data=f"b:{job_id}")); return kb
+    def edit(text, markup=None):
+        try: bot.edit_message_text(text, chat_id=user_id, message_id=status.message_id,
+                                    reply_markup=markup, disable_web_page_preview=True)
+        except Exception: pass
+    for n, url in enumerate(urls, start=1):
+        if stop.is_set(): stopped = True; break
+        edit(f"⏳ {n}/{total} download...\n✅ {len(ok_slots)} ready  ❌ {len(failed)} fail", stop_markup())
+        r, info = process_link(url, cid, user_id)
+        if r == "ok": ok_slots.append(info)
+        elif r == "dup": dup += 1
+        elif r == "big": big += 1; failed.append(url)
+        else: failed.append(url)
+        time.sleep(1.5)
+    bulk_jobs.pop(job_id, None)
+    if total == 1 and not stopped:
+        if ok_slots: edit(f"✅ Ready. <b>{html.escape(str(cid))}</b> e jabe: <b>{pretty_time(ok_slots[0])}</b>")
+        elif dup: edit("⚠️ Agei queue te ache.")
+        elif big: edit("⚠️ 50 MB boro.")
+        else: edit("❌ Download fail. Private/deleted/unsupported.")
+        return
+    lines = ["🛑 <b>Bondho.</b>" if stopped else "🏁 <b>Shesh!</b>", ""]
+    lines.append(f"✅ Schedule: <b>{len(ok_slots)}</b>")
+    if dup: lines.append(f"⚠️ Duplicate: {dup}")
+    if big: lines.append(f"⚠️ 50MB+: {big}")
+    if len(failed) - big: lines.append(f"❌ Fail: {len(failed) - big}")
+    if stopped: lines.append(f"⏹ Baki: {total - n + 1}")
+    if ok_slots:
+        ok_slots.sort()
+        lines.append(""); lines.append(f"📅 Prothom: {pretty_time(ok_slots[0])}")
+        lines.append(f"📅 Shesh: {pretty_time(ok_slots[-1])}")
+    edit("\n".join(lines))
+    if failed:
+        out = ["❌ Fail gulo:", ""] + [html.escape(u) for u in failed]
+        try: reply_long(status, out)
+        except Exception as exc: log.error("failed list: %s", exc)
+
+def start_bulk(user_id, raw_urls):
+    cid = get_active_channel_id(user_id)
+    if not cid:
+        try: bot.send_message(user_id, "❌ Kono channel nai. /addchannel diye add korun.")
+        except Exception: pass
+        return 0
+    seen, clean = set(), []
+    for raw in raw_urls:
+        u = normalize_url(raw)
+        if u not in seen: seen.add(u); clean.append(u)
+    clean = clean[:100]
+    if not clean: return 0
+    status = bot.send_message(user_id, f"⏳ {len(clean)} ta link paoa gelo → {html.escape(str(cid))}")
+    job_id = uuid.uuid4().hex[:8]; stop = threading.Event(); bulk_jobs[job_id] = stop
+    threading.Thread(target=run_bulk, args=(user_id, cid, status, clean, job_id, stop), daemon=True).start()
+    return len(clean)
 
 # ---------- Entry ----------
 if __name__ == "__main__":
